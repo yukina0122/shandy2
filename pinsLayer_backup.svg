@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SVGMap.js WebApp Layer (動的レイヤー)
+  参考パターン: チュートリアル5 (DynamicContents) / チュートリアル14-15 (動的API連携)
+  https://www.svgmap.org/wiki/index.php?title=チュートリアル5
+  https://www.svgmap.org/wiki/index.php?title=チュートリアル15
+
+  ★注意: svgMapLayerLib.js が実際に提供する座標変換・DOM操作ヘルパーの
+  厳密な関数シグネチャは公開ドキュメントだけでは確証が持てませんでした。
+  下記は tutorial7 に掲載されているタイル読み込みレイヤーの構造
+  (addEventListener("load", init); addEventListener("zoomPanMap", zpmFunc);)
+  を踏襲したベストエフォート実装です。実機・実ブラウザでの動作確認が必須です。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+
+  <!--
+    このドキュメント自身のCRS宣言。SVGMap.jsは各SVGドキュメントが
+    自分自身の座標系を自己申告する設計になっており、これが無いと
+    「This document don't have CRS. Never renders.」で描画がスキップされる。
+    Container.svg と同じ変換行列(x=lon*100000, y=-lat*100000)にして
+    座標系を合わせている。
+  -->
+  <globalCoordinateSystem srsName="http://purl.org/crs/84"
+                           transform="matrix(100000,0,0,-100000,0,0)" />
+
+  <script type="text/javascript"
+          xlink:href="https://cdn.jsdelivr.net/gh/svgmap/svgmapjs@latest/svgMapLayerLib.js" />
+
+  <script type="text/javascript"><![CDATA[
+
+    addEventListener("load", init);
+    addEventListener("zoomPanMap", onZoomPanMap);
+
+    var lastFetchCenter = null;
+    var minMoveMeters = 250;
+    // 同じ画面位置に複数の施設ピンが重ならないようにする最小間隔。
+    // 重なった場合は、現在地（取得時の地図中心）に近い施設を優先する。
+    var minPinSeparationMeters = 35;
+    var pendingTimer = null;
+    var activeController = null;
+
+    function init() {
+      console.info("[pinsLayer] 初期化完了");
+      window.parent.postMessage({ type: "pinsLayerReady" }, "*");
+      onZoomPanMap();
+    }
+
+    // svgMap.getGeoViewBox() はすでに地理座標（経度・緯度）を返す。
+    // CRS の matrix は SVG 上の描画座標に変換するときだけ使う。
+    function onZoomPanMap(evt) {
+      var geoViewBox = (typeof svgMap !== "undefined" && svgMap.getGeoViewBox)
+        ? svgMap.getGeoViewBox()
+        : (evt && evt.detail && evt.detail.geoViewBox);
+
+      if (!geoViewBox) {
+        console.warn("[pinsLayer] geoViewBox を取得できませんでした。svgMapLayerLib.js のAPIを確認してください。");
+        return;
+      }
+
+      var centerLon = geoViewBox.x + geoViewBox.width / 2;
+      var centerLat = geoViewBox.y + geoViewBox.height / 2;
+      console.info("[pinsLayer] 周辺ピンを検索", centerLat, centerLon);
+
+      if (lastFetchCenter) {
+        var d = haversine(lastFetchCenter.lat, lastFetchCenter.lon, centerLat, centerLon);
+        if (d < minMoveMeters) return;
+      }
+      lastFetchCenter = { lat: centerLat, lon: centerLon };
+
+      // GPS の連続イベントやパン操作中のリクエストをまとめる。
+      clearTimeout(pendingTimer);
+      pendingTimer = setTimeout(function () {
+        fetchAndRenderPins(centerLat, centerLon);
+      }, 350);
+    }
+
+    function haversine(lat1, lon1, lat2, lon2) {
+      var R = 6371000;
+      var toRad = function (d) { return d * Math.PI / 180; };
+      var dLat = toRad(lat2 - lat1);
+      var dLon = toRad(lon2 - lon1);
+      var a = Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    var OVERPASS_ENDPOINTS = [
+      "https://overpass-api.de/api/interpreter",
+      "https://overpass.kumi.systems/api/interpreter",
+      "https://overpass.openstreetmap.ru/api/interpreter",
+    ];
+
+    async function queryOverpass(query, timeoutMs) {
+      var lastError;
+      for (var i = 0; i < OVERPASS_ENDPOINTS.length; i++) {
+        var endpoint = OVERPASS_ENDPOINTS[i];
+        var controller = new AbortController();
+        activeController = controller;
+        var timer = setTimeout(function () { controller.abort(); }, timeoutMs || 10000);
+        try {
+          var res = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "text/plain;charset=UTF-8" },
+            body: query,
+            signal: controller.signal
+          });
+          clearTimeout(timer);
+          if (!res.ok) throw new Error("Overpass応答エラー: " + res.status);
+          return await res.json();
+        } catch (e) {
+          // 新しい位置での取得を優先するために中断した場合は、
+          // 代替サーバーへのリトライをせずこのリクエストを終了する。
+          if (controller.signal.aborted) throw e;
+          lastError = e;
+          console.warn("[pinsLayer] " + endpoint + " 失敗", e);
+        } finally {
+          clearTimeout(timer);
+          if (activeController === controller) activeController = null;
+        }
+      }
+      throw lastError;
+    }
+
+    async function fetchAndRenderPins(lat, lon) {
+      if (activeController) activeController.abort();
+
+      var delta = 0.002;
+      var query =
+        '[out:json][timeout:8];' +
+        '(' +
+        'nwr["amenity"~"^(cafe|restaurant|fast_food|toilets|pharmacy|hospital|parking)$"]["name"]' +
+        '(' + (lat - delta) + ',' + (lon - delta) + ',' + (lat + delta) + ',' + (lon + delta) + ');' +
+        'nwr["shop"]["name"]' +
+        '(' + (lat - delta) + ',' + (lon - delta) + ',' + (lat + delta) + ',' + (lon + delta) + ');' +
+        // 建物は外周と height / building:levels を取得する。高さの情報がない
+        // 建物は控えめな既定値で描く（OSMでは高さタグが未登録の建物も多いため）。
+        'way["building"]' +
+        '(' + (lat - delta) + ',' + (lon - delta) + ',' + (lat + delta) + ',' + (lon + delta) + ');' +
+        ');out tags center geom;';
+
+      try {
+        var data = await queryOverpass(query);
+        var elements = data.elements || [];
+        var renderedPins = renderMapFeatures(elements, lat, lon);
+        window.parent.postMessage({ type: "pinsLoaded", count: renderedPins }, "*");
+      } catch (e) {
+        if (e && e.name === "AbortError") return;
+        console.error("[pinsLayer] ピン取得失敗", e);
+        window.parent.postMessage({
+          type: "pinsLoadError",
+          message: "周辺ピンを取得できませんでした"
+        }, "*");
+      }
+    }
+
+    function mapPoint(lat, lon) {
+      return { x: lon * 100000, y: -lat * 100000 };
+    }
+
+    function createSvgElement(name) {
+      return document.createElementNS("http://www.w3.org/2000/svg", name);
+    }
+
+    function buildingHeightMeters(tags) {
+      var rawHeight = String((tags && tags.height) || "").match(/[0-9]+(?:\.[0-9]+)?/);
+      if (rawHeight) return Math.min(180, Math.max(3, Number(rawHeight[0])));
+
+      var rawLevels = String((tags && tags["building:levels"]) || "").match(/[0-9]+(?:\.[0-9]+)?/);
+      if (rawLevels) return Math.min(180, Math.max(3, Number(rawLevels[0]) * 3));
+      return 8;
+    }
+
+    function renderBuildings(elements, svgRoot) {
+      var existing = svgRoot.querySelectorAll(".osm-building");
+      for (var i = 0; i < existing.length; i++) existing[i].remove();
+
+      elements.forEach(function (item) {
+        if (item.type !== "way" || !item.tags || !item.tags.building || !Array.isArray(item.geometry)) return;
+        var points = item.geometry
+          .filter(function (point) { return point && point.lat != null && point.lon != null; })
+          .map(function (point) { return mapPoint(point.lat, point.lon); });
+        if (points.length < 3) return;
+
+        var height = buildingHeightMeters(item.tags);
+        // 地図の座標系はおよそ 1 単位 = 1m。北西方向へ持ち上げ、
+        // OSMの実高さ（または階数からの推定）を立体的に見せる。
+        var liftX = height * 0.32;
+        var liftY = -height * 0.48;
+        var group = createSvgElement("g");
+        group.setAttribute("class", "osm-building");
+        group.setAttribute("pointer-events", "none");
+
+        for (var edge = 0; edge < points.length; edge += 1) {
+          var from = points[edge];
+          var to = points[(edge + 1) % points.length];
+          var side = createSvgElement("polygon");
+          side.setAttribute("points", [
+            from.x + "," + from.y,
+            to.x + "," + to.y,
+            (to.x + liftX) + "," + (to.y + liftY),
+            (from.x + liftX) + "," + (from.y + liftY)
+          ].join(" "));
+          side.setAttribute("fill", "#52606d");
+          side.setAttribute("fill-opacity", "0.72");
+          group.appendChild(side);
+        }
+
+        var roof = createSvgElement("polygon");
+        roof.setAttribute("points", points.map(function (point) {
+          return (point.x + liftX) + "," + (point.y + liftY);
+        }).join(" "));
+        roof.setAttribute("fill", "#a6b4c1");
+        roof.setAttribute("fill-opacity", "0.88");
+        roof.setAttribute("stroke", "#e7eef5");
+        roof.setAttribute("stroke-width", "0.8");
+        group.appendChild(roof);
+        svgRoot.appendChild(group);
+      });
+    }
+
+    function chooseVisiblePins(elements, centerLat, centerLon) {
+      var candidates = elements
+        .map(function (item) {
+          if (item.tags && item.tags.building) return null;
+          var lat = item.lat != null ? item.lat : item.center && item.center.lat;
+          var lon = item.lon != null ? item.lon : item.center && item.center.lon;
+          var name = item.tags && item.tags.name;
+          if (lat == null || lon == null || !name) return null;
+          return { item: item, lat: lat, lon: lon, name: name, distance: haversine(centerLat, centerLon, lat, lon) };
+        })
+        .filter(Boolean)
+        .sort(function (a, b) { return a.distance - b.distance; });
+
+      var visible = [];
+      candidates.forEach(function (candidate) {
+        var overlaps = visible.some(function (shown) {
+          return haversine(candidate.lat, candidate.lon, shown.lat, shown.lon) < minPinSeparationMeters;
+        });
+        if (!overlaps) visible.push(candidate);
+      });
+      return visible;
+    }
+
+    function renderMapFeatures(elements, centerLat, centerLon) {
+      var svgRoot = document.rootElement || document.documentElement;
+      renderBuildings(elements, svgRoot);
+
+      var existing = svgRoot.querySelectorAll(".osm-pin");
+      for (var i = 0; i < existing.length; i++) existing[i].remove();
+
+      var visiblePins = chooseVisiblePins(elements, centerLat, centerLon);
+      visiblePins.forEach(function (pin) {
+        var pinLat = pin.lat;
+        var pinLon = pin.lon;
+        var name = pin.name;
+
+        // Container.svg の globalCoordinateSystem に対応する座標変換
+        var x = pinLon * 100000;
+        var y = -pinLat * 100000;
+
+        var g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+        g.setAttribute("class", "osm-pin");
+        // non-scaling object (チュートリアル2a方式): ズームしても大きさが変わらない
+        g.setAttribute("transform", "translate(" + x + "," + y + ")");
+
+        var circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        circle.setAttribute("r", "30");
+        circle.setAttribute("fill", "#ff5722");
+        circle.setAttribute("stroke", "#fff");
+        circle.setAttribute("stroke-width", "6");
+
+        var title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+        title.textContent = name;
+
+        g.appendChild(circle);
+        g.appendChild(title);
+
+        (function (selectedName, selectedLat, selectedLon) {
+          g.addEventListener("click", function () {
+            window.parent.postMessage({
+              type: "pinSelected",
+              name: selectedName,
+              lat: selectedLat,
+              lon: selectedLon
+            }, "*");
+          });
+        })(name, pinLat, pinLon);
+
+        svgRoot.appendChild(g);
+      });
+      return visiblePins.length;
+    }
+
+  ]]></script>
+
+</svg>
